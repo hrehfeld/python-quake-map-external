@@ -23,9 +23,19 @@ from collections import OrderedDict as odict
 
 import mathhelper
 
+from subprocess import check_call, check_output
+
+
 #from . import mathhelper
 
 __version__ = '0.0.1'
+
+basepath = Path('/home/hrehfeld/.quakespasm')
+id1_path = basepath / 'id1'
+compiler_base = Path('/home/hrehfeld/projects/map_compile/ericw-tools-v0.18.1-Linux/bin')
+
+prefab_info_suffix = '.prefabinfo'
+
 
 EPS = 0.00001
 
@@ -34,23 +44,64 @@ assumed_texture_size = 64
 
 worldspawn_name = 'worldspawn'
 map_external_name = 'misc_external_map'
-external_map_filename_key = '_external_map'
+map_external_angles_key = '_external_map_angles'
+map_external_angles_yaw_key = '_external_map_angle'
+map_external_filename_key = '_external_map'
 wad_key = 'wad'
 wad_sep = ';'
 origin_key = 'origin'
 origin_sep = ' '
-angles_key = 'mangle'
+angles_key = 'angles'
 angles_yaw_key = 'angle'
 angles_sep = ' '
-angles_yaw_axis = 0
-angles_roll_axis = 2
+angles_yaw_axis = 2
+angles_roll_axis = 0
 angles_pitch_axis = 1
 
+prefab_name_prefix = 'prefab_'
+prefab_name_key = 'prefab_name'
+
+tb_def_key = '_tb_def'
+
 brushes_key = 'brushes'
+
+fgd_marker = '///prefabs -- do not edit after this line!\n'
+fgd_prefab_marker = '///prefab: '
 
 def warning(s):
     print('WARNING:', s)
 
+
+def fgd_compile(path):
+    cwd = id1_path
+    out_path = path.with_suffix('.bsp')
+    cmd = [compiler_base / 'qbsp', '-nopercent', '-nofill', '-noverbose', path, out_path]
+
+    check_call(cmd, cwd=str(cwd))
+    cmd = [compiler_base / 'light', '-light', '255'] + [out_path]
+    check_call(cmd, cwd=str(cwd))
+    return out_path
+
+
+def bsp_get_aabb(bsp_path):
+    cmd = [compiler_base / 'bsputil', '--check', str(bsp_path)]
+    output = check_output(cmd, encoding='utf-8')
+    output = output.split('\n')
+    prefix = 'world mins: '
+    # world mins: 1.000000 1.000000 1.000000 maxs: 31.000000 31.000000 63.000000
+    for l in output:
+        if l.startswith(prefix):
+            l = l[len(prefix):]
+            l = l.split()
+            l.remove('maxs:')
+            assert(len(l) == 6)
+
+            return [float(s) for s in l]
+    
+
+def path_stem_add(p, s):
+    return p.parent / (p.stem + s)
+            
 
 def split_value(v, sep=' ', type=str):
     return [type(s) for s in v.split(sep)]
@@ -66,15 +117,18 @@ def set_entity_key(ent, key, v):
     setattr(ent, key, v)
 
 
+def set_entity_keys(ent, ks):
+    for k, v in ks.items():
+        set_entity_key(ent, k, v)
+
+
 def del_entity_key(ent, key):
     if hasattr(ent, key):
         delattr(ent, key)
 
 
 def get_entity_keys(e):
-    print(e.__dict__)
     r = odict((p for p in e.__dict__.items() if p[0] != brushes_key))
-    print(r)
     return r
 
 
@@ -96,9 +150,7 @@ def set_entity_origin(ent, origin):
     set_entity_vector(ent, origin_key, origin, sep=origin_sep)
 
 
-def set_entity_angles(ent, mat):
-    angles = extract_angles(mat)
-
+def set_entity_angles(ent, angles, key=angles_key, yaw_key=angles_yaw_key):
     def clean_angle(a):
         while a < 0:
             a += 2 * math.pi
@@ -109,17 +161,17 @@ def set_entity_angles(ent, mat):
     if abs(angles[angles_pitch_axis]) < EPS and abs(angles[angles_roll_axis]) < EPS:
         angle = (angles[angles_yaw_axis])
         if abs(angle) > EPS:
-            set_entity_key(ent, angles_yaw_key, clean_angle(angle))
+            set_entity_key(ent, yaw_key, clean_angle(angle))
         else:
-            del_entity_key(ent, angles_yaw_key)
-        del_entity_key(ent, angles_key)
+            del_entity_key(ent, yaw_key)
+        del_entity_key(ent, key)
     else:
         angles = angles[2 - angles_yaw_axis], angles[2 - angles_pitch_axis], angles[2 - angles_roll_axis]
-        set_entity_vector(ent, angles_key, [clean_angle(a) for a in angles], sep=angles_sep)
-        del_entity_key(ent, angles_yaw_key)
+        set_entity_vector(ent, key, [clean_angle(a) for a in angles], sep=angles_sep)
+        del_entity_key(ent, yaw_key)
     
 
-def parse_origin(e):
+def origin_mat(e):
     origin = get_entity_origin(e)
 
     return mathhelper.Matrices.translation_matrix(*origin)
@@ -139,8 +191,12 @@ def parse_angles(ent):
     else:        
         angles = _angles
 
-    print(ent.classname, angles, 'degrees')
-        
+    #print(ent.classname, angles, 'degrees')
+
+    return angles
+
+
+def angles_to_mat(angles):
     angles = [-radians(float(a)) for a in angles]
 
     rotation = rotation_z_matrix(angles[0]) @ rotation_y_matrix(angles[1]) @ rotation_x_matrix(angles[2])
@@ -151,7 +207,7 @@ def parse_angles(ent):
 
 def clean_ent(e):
     for k, v in get_entity_keys(e).items():
-        print(k, v)
+        #print(k, v)
         if v == '""':
             delattr(e, k)
 
@@ -162,13 +218,13 @@ def get_wads(e):
 
 
 def set_wads(e, wads):
-    if not wads:
-        return
-
     r = []
     for w in wads:
         if w not in r:
             r.append(w)
+
+    if not r:
+        return
 
     return setattr(e, wad_key, wad_sep.join(r))
 
@@ -465,108 +521,269 @@ def extract_angles(mat):
     t3 = atan2(s1 * m(2, 0) - c1 * m(1, 0), c1 * m(1, 1) - s1 * m(2, 1))
     return t1, t2, t3
 
-parser = argparse.ArgumentParser(prog='map_external',
-                description='TODO',
-                epilog='TODO')
 
-parser.add_argument('map', help='base map')
-parser.add_argument('out', help='output map')
+def main():
+    parser = argparse.ArgumentParser(prog='map_external',
+                    description='TODO',
+                    epilog='TODO')
 
-parser.add_argument('-v',
-                    '--version',
-                    dest='version',
-                    action='version',
-                    version='%(prog)s {}'.format(__version__),
-                    help='display version number')
+    parser.add_argument('map', help='base map')
+    parser.add_argument('out', help='output map')
 
-parser.add_argument('-q',
-                    '--quiet',
-                    dest='quiet',
-                    action='store_true',
-                    help='quiet mode')
+    parser.add_argument('-v',
+                        '--version',
+                        dest='version',
+                        action='version',
+                        version='%(prog)s {}'.format(__version__),
+                        help='display version number')
 
-args = parser.parse_args()
+    parser.add_argument('-q',
+                        '--quiet',
+                        dest='quiet',
+                        action='store_true',
+                        help='quiet mode')
 
-
-base_filepath = Path(args.map)
-out_filepath = Path(args.out)
-
-with base_filepath.open('r') as f:
-    base_map = m.loads(f.read())
+    args = parser.parse_args()
 
 
-worldspawn = None
+    base_filepath = Path(args.map)
+    out_filepath = Path(args.out)
 
-for ent in base_map:
-    t = ent.classname
-    if t == worldspawn_name:
-        worldspawn = ent
-
-    clean_ent(ent)
-    print(t)
-
-assert(worldspawn)
-print(worldspawn)
+    with base_filepath.open('r') as f:
+        base_map = m.loads(f.read())
 
 
-    
+    worldspawn = None
 
-for ient, ent in ((i, e) for i, e in enumerate(base_map) if e.classname == map_external_name):
-    t = ent.classname
-    print('===============next entity', ient, t)
+    for ent in base_map:
+        t = ent.classname
+        if t == worldspawn_name and not worldspawn:
+            worldspawn = ent
+
+        clean_ent(ent)
+
+    fgd_prefabs = odict()
+
+    # load fgd
+    fgd_path = get_entity_key(worldspawn, tb_def_key)
+    if fgd_path is None:
+        warning('no custom fgd, can\'t add prefab_ defs')
+        fgd = None
+    else:
+        prefix = 'external:'
+        assert(fgd_path.startswith(prefix))
+        fgd_path = fgd_path[len(prefix):]
+
+        with Path(fgd_path).open('r') as f:
+            fgd = f.read()
+
+        end = fgd.rfind(fgd_marker)
+        defs = fgd[end:]
+
+        for l in defs.split('\n'):
+            if l.startswith(fgd_prefab_marker):
+                l = l.split(' ')
+                marker, name, path = l
+                assert(name not in fgd_prefabs)
+                fgd_prefabs[name] = id1_path / Path(path)
 
 
+        if end is not None:
+            fgd = fgd[:end]
+        
 
-    ks = get_entity_keys(ent)
-    if external_map_filename_key in ks:
-        p = base_filepath.parent / (ks[external_map_filename_key])
-        if not p.exists():
-            warning('external map %s doesn\'t exist!' % p)
+    assert(worldspawn)
+
+    temp_sub_prefabs = odict()
+    fgd_models = odict()
+    fgd_maps = odict()
+
+    # make a copy of list so we can append to base_map
+    for ient, ent in ((i, e) for i, e in enumerate(list(base_map))):
+        t = ent.classname
+        print('===============next entity', ient, t)
+
+        if ent.classname.startswith(prefab_name_prefix):
+            name = ent.classname[len(prefab_name_prefix):]
+            path = fgd_prefabs[name]
+            print('converting %s to %s with %s' % (ent.classname, map_external_name, path), name)
+            set_entity_key(ent, map_external_filename_key, path)
+            ent.classname = map_external_name
+
+        if ent.classname != map_external_name:
             continue
-        else:
-            ent_rotation_mat = parse_angles(ent)
-            ent_mat = parse_origin(ent) @ ent_rotation_mat
 
+        ks = get_entity_keys(ent)
+        if map_external_filename_key in ks:
+            base_map.remove(ent)
+            ext_map_path = base_filepath.parent / (ks[map_external_filename_key])
+            ent_angles = parse_angles(ent)
+            ent_rotation_mat = angles_to_mat(ent_angles)
+            ent_origin = get_entity_origin(ent)
+            ent_mat = origin_mat(ent) @ ent_rotation_mat
+
+            if not ext_map_path.exists():
+                warning('external map %s doesn\'t exist!' % ext_map_path)
+                continue
             # everything prefixed with o is from the external map
-            with p.open('r') as f:
-                omap = m.loads(f.read())
+            with ext_map_path.open('r') as f:
+                s = f.read()
+            omap = m.loads(s)
 
+            oworldspawn = omap[0]
+
+            prefab_name = get_entity_key(oworldspawn, prefab_name_key, ext_map_path.stem)
+            if ' ' in prefab_name:
+                warning('%s: prefab_name (%s) cannot contain space (" ")' % (ext_map_path, prefab_name))
+                prefab_name = ext_map_path.stem
+
+            fgd_model_worldspawn = m.Entity()
+            fgd_model_worldspawn.classname = worldspawn_name
+
+            wads = []
             for ioent, oent in enumerate(omap):
-                # copy wad info from all ents
-                set_wads(worldspawn, get_wads(worldspawn) + get_wads(oent))
-
-
                 oent_origin = get_entity_origin(oent)
+                oent_angles = parse_angles(oent)
+                oent_mat = angles_to_mat(oent_angles) @ mathhelper.Matrices.translation_matrix(*oent_origin)
+                oent_mat = oent_mat @ ent_mat
+
+                wads += get_wads(oent)
+
+                _angles_key = angles_key
+                _angles_yaw_key = angles_yaw_key
+                if oent.brushes:
+                    fgd_model_worldspawn.brushes += oent.brushes
+
+                    #bs = [transform_brush(oent_mat, b) for b in bs]
+                    # ot = oent.classname
+                    # if ot == worldspawn_name:
+                    #     # TODO: copy ent keys?
+                    #     worldspawn.brushes += oent.brushes
+
+                    oent_base_path = path_stem_add(ext_map_path, '_' + oent.classname)
+
+                    # don't overwrite if e.g. two func_door in the prefab
+                    oent_path = oent_base_path
+                    i = 0
+                    while oent_path in temp_sub_prefabs and temp_sub_prefabs[oent_path] != ext_map_path:
+                        oent_path = oent_base_path + str(ioent)
+                        i += 1
+                    out_p = oent_path.with_suffix('.temp.map')
+                    out_p_s = str(out_p)
+
+                    if out_p_s in temp_sub_prefabs:
+                        assert(temp_sub_prefabs[out_p_s] == ext_map_path)
+                    else:
+                        e = m.Entity()
+                        e.classname = worldspawn_name
+                        e.brushes = oent.brushes
+
+                        s = m.dumps([e])
+
+                        print('writing %s' % out_p)
+                        with out_p.open('w') as f:
+                            f.write(s)
+
+                        temp_sub_prefabs[out_p_s] = ext_map_path
+
+                    e = m.Entity()
+                    oks = get_entity_keys(oent)
+                    set_entity_keys(e, oks)
+
+                    e.classname = map_external_name
+                    e._external_map = str(out_p)
+                    e._external_map_classname = oent.classname
+                    if 'angles' in oks:
+                        e._external_map_angles = oent.angles
+                    #e._external_map_scale =
+
+                    _angles_key = map_external_angles_key
+                    _angles_yaw_key = map_external_angles_yaw_key
+
+
+                    oent = e
+
                 set_entity_origin(oent, transform_point(ent_mat, oent_origin))
-                print(oent.classname)
-                oent_mat = parse_angles(oent) @ mathhelper.Matrices.translation_matrix(*oent_origin)
-                print(oent_mat)
-                print([math.degrees(a) for a in extract_angles(ent_mat)])
-                print([math.degrees(a) for a in extract_angles(ent_rotation_mat)])
-                print([math.degrees(a) for a in extract_angles(oent_mat)])
-                print([math.degrees(a) for a in extract_angles(ent_mat @ oent_mat)])
-                print(oent_origin)
-                oent_mat =  oent_mat @ ent_mat
+                set_entity_angles(oent, extract_angles(oent_mat), key=_angles_key, yaw_key=_angles_yaw_key)
 
-                set_entity_angles(oent, (oent_mat))
+                if oent.classname != worldspawn_name:
+                    base_map.append(oent)
 
-                bs = oent.brushes
-                bs = [transform_brush(oent_mat, b) for b in bs]
-                oent.brushes = bs
+            # copy wad info from all ents
+            set_wads(worldspawn, get_wads(worldspawn) + wads)
 
-                ot = oent.classname
-                if ot == worldspawn_name:
-                    # TODO: copy ent keys?
-                    worldspawn.brushes += oent.brushes
-                else:
-                    base_map.insert(ient, oent)
+            # dump into fgd later
+            # make sure duplicate names all reference the same prefab
+            if prefab_name in fgd_maps:
+                print(fgd_maps[prefab_name], ext_map_path)
+                assert(fgd_maps[prefab_name] == ext_map_path)
+            if ' ' in prefab_name:
+                raise Exception('%s: prefab_name (%s) cannot contain space (" ")' % (ext_map_path, prefab_name))
+            
+            # compile external map for fgd
+            if prefab_name not in fgd_models:
+                set_wads(fgd_model_worldspawn, wads)
+                fgd_models[prefab_name] = fgd_model_worldspawn
+                print(fgd_model_worldspawn.wad)
+                
+                
+            fgd_maps[prefab_name] = (ext_map_path)
 
-        base_map.remove(ent)
+    if fgd is not None:
+        defs = []
+        for name, (map_path) in fgd_maps.items():
+            model_worldspawn = fgd_models[name]
+            #print(name, model_worldspawn)
+            assert(map_path.exists())
+
+            fgd_model = m.dumps([model_worldspawn])
+            fgd_model_path = path_stem_add(map_path, '-fgd').with_suffix('.map')
+            with fgd_model_path.open('w') as f:
+                f.write(fgd_model)
+            model_path = fgd_compile(fgd_model_path)
+            assert(model_path.exists())
+
+            
+            aabb = bsp_get_aabb(model_path)
+            vs = [abs(v) for v in aabb[:3]]
+            for i in range(3):
+                x = abs(aabb[3 + i])
+                vs[i] += x
+                vs[i] *= 0.5
+            aabb = [-v for v in vs] + vs
+            aabb = [str(s) for s in aabb]
+            aabb = ' '.join(aabb[:3]) + ', ' + ' '.join(aabb[3:])
+            #print(aabb)
+            
+            map_path = map_path.resolve().relative_to(id1_path.resolve())
+            model_path = model_path.resolve().relative_to(id1_path.resolve())
+
+            vs = ['map_path(string) : "path to the source map file" : "%s" : "Long description"' % map_path]
+            vs += ['%s(string) : "%s (Pitch Yaw Roll)"' % (angles_key, angles_key)]
+            vs = '\n'.join(vs)
 
 
-print(omap)
-print(getattr(worldspawn, wad_key))
-s = m.dumps(base_map)
-    
-with out_filepath.open('w') as f:
-    f.write(s)
+            d = '@PointClass size(%s) color(200 200 0) studio("%s") = %s : "%s" [%s]'  % (aabb, model_path, prefab_name_prefix + name, model_path, vs)
+            c = fgd_prefab_marker + '%s %s' % (name, map_path)
+            defs.append(d)
+            defs.append(c)
+
+        defs += [fgd_prefab_marker + name + ' ' + str(path.resolve().relative_to(id1_path.resolve())) for name, path in fgd_prefabs.items() if name not in fgd_maps]
+
+        defs = '\n'.join(defs)
+
+        fgd += fgd_marker + defs
+        with Path(fgd_path).open('w') as f:
+            f.write(fgd)
+
+
+
+
+    #print(omap)
+    #print(getattr(worldspawn, wad_key))
+    s = m.dumps(base_map)
+
+    with out_filepath.open('w') as f:
+        f.write(s)
+
+main()
